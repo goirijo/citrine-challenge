@@ -1,0 +1,517 @@
+#!/usr/bin/env python
+
+from __future__ import division
+from __future__ import print_function
+from __future__ import absolute_import
+
+import sys
+import numpy as np
+from scipy.stats import multivariate_normal
+import time
+import signal
+import progressbar
+
+
+class Constraint():
+    """Constraints loaded from a file."""
+
+    def __init__(self, fname):
+        """
+        Construct a Constraint object from a constraints file
+
+        :param fname: Name of the file to read the Constraint from (string)
+        """
+        with open(fname, "r") as f:
+            lines = f.readlines()
+        # Parse the dimension from the first line
+        self.n_dim = int(lines[0])
+        # Parse the example from the second line
+        self.example = [float(x) for x in lines[1].split(" ")[0:self.n_dim]]
+
+        # Run through the rest of the lines and compile the constraints
+        self.exprs = []
+        for i in range(2, len(lines)):
+            # support comments in the first line
+            if lines[i][0] == "#":
+                continue
+            self.exprs.append(compile(lines[i], "<string>", "eval"))
+        return
+
+    def get_example(self):
+        """Get the example feasible vector"""
+        return self.example
+
+    def get_ndim(self):
+        """Get the dimension of the space on which the constraints are defined"""
+        return self.n_dim
+
+    def apply(self, x):
+        """
+        Apply the constraints to a vector, returning True only if all are satisfied
+
+        :param x: list or array on which to evaluate the constraints
+        """
+        #Don't allow compositions outside they hypercube
+        if max(x) > 1.0 or min(x) < 0:
+            return False
+        for expr in self.exprs:
+            if not eval(expr):
+                return False
+        return True
+
+
+def is_positive_definite(mat):
+    return np.all(np.linalg.eigvals(mat) > 0)
+
+
+def progress_bar(maxval):
+    bar = progressbar.ProgressBar(
+        maxval=maxval,
+        widgets=[progressbar.Bar('=', '[', ']'), ' ',
+                 progressbar.Percentage()])
+    return bar
+
+
+def _parsed_input(argv):
+    """Extract the three required arguments from the command line
+    and send them back as a tuple:
+    input file, output file, number of samples
+
+    Parameters
+    ----------
+    argv : sys.argv
+
+    Returns
+    -------
+    str,str,str
+
+    """
+    return argv[1:4]
+
+
+class EdgeDetector(object):
+    """Given a Constraint, creates a set of unit vectors,
+    and grows the vectors around a particular point until
+    the constraint edges are hit. The distance from the point
+    to the edge can later be used to create a feasible Gaussian
+    distribution from which to sample points."""
+
+    def __init__(self, constraint, max_search):
+        """Initialize with the contraints
+
+        Parameters
+        ----------
+        constraint : Constraint
+        max_search : int, how many steps to take in binary edge search
+
+
+        """
+        self._constraint = constraint
+        self._max_search = max_search
+
+    def _aligned_vectors(self, origin):
+        """Given a new origin from which to extend the unit vectors,
+        find the best orientation for them, i.e. directions that
+        are orthogonal but penetrate as much into the "good" constraint
+        space as possible.
+
+        This isn't currently implemented, and will always just return
+        the Cartesian directions.
+
+        Parameters
+        ----------
+        origin : array
+
+        Returns
+        -------
+        list of unit vectors, one for each dimension
+
+        """
+        return np.eye(self._constraint.get_ndim())
+
+    def _dimensional_sanity_or_throw(self, vector):
+        """If the dimensions of the vector are consistent with the internal
+        constraints, do nothing, otherwise throw an exception.
+
+        Parameters
+        ----------
+        vector : array
+
+        Returns
+        -------
+        void
+
+        """
+        if (len(vector) != self._constraint.get_ndim()):
+            raise ValueError(
+                "Dimensions of vector are not consistent with search space!")
+        return
+
+    def _strahlung(self, origin, direction):
+        """Detect one edge from the origin along the given direction. Uses
+        binary a binary search at a fixed number of attempts.
+        The provided origin must be a valid point within the search space.
+
+        Parameters
+        ----------
+        origin : array
+        direction : array
+
+        Returns
+        -------
+        array
+
+        """
+        #First scale the direction to ensure you'll go at least beyond the unit hypercube
+        right = origin + direction / max(np.abs(direction))
+        left = origin
+        target = (left + right) / 2
+
+        #binary search for max_search attempts
+        for i in xrange(self._max_search):
+            if self._constraint.apply(target):
+                left = target
+            else:
+                right = target
+
+            target = (left + right) / 2
+
+        assert (self._constraint.apply(left))
+
+        #This can happen if your origin is right on the boundary
+        if not self._constraint.apply(target):
+            target = left
+
+        return target
+
+    def detect_edges(self, origin):
+        """Searches outwards from the given origin in orthogonal
+        directions, both positive and negative, and returns the vector
+        from the origin to the search boundary along each direction.
+
+        Parameters
+        ----------
+        origin : array
+
+        Returns
+        -------
+        (array,array), vectors spanning from origin
+
+        """
+        origin = np.array(origin)
+        if not self._constraint.apply(origin):
+            raise ValueError(
+                "Provided origin is not a valid point within the search space!")
+
+        self._dimensional_sanity_or_throw(origin)
+
+        #slots for each distance, both in the positive and negative directions
+        dim = self._constraint.get_ndim()
+        edges = (np.zeros((dim, dim)), np.zeros((dim, dim)))
+        directions = self._aligned_vectors(origin)
+
+        assert (directions.shape == edges[0].shape)
+
+        for i in xrange(dim):
+            d = directions[i]
+            pos = self._strahlung(origin, d)
+            neg = self._strahlung(origin, -d)
+
+            edges[0][i] = pos
+            edges[1][i] = neg
+
+        return edges
+
+
+class SourceDistribution(object):
+    """Gaussian distribution around a feasible point.
+    Starting on the feasible point, "rays" are emitted
+    outwards until a boundary is found. The lengths of these
+    rays determine the width of the normal distribution, from
+    which new feasible points can be guessed."""
+
+    def __init__(self, origin, edge_detector):
+        """Construct from the hyperspace constraints and specifying
+        how much effort should go into finding the boundary.
+
+        Parameters
+        ----------
+        origin : array
+        edge_detector : EdgeDetector
+
+
+        """
+        self._origin = origin
+        self._edge_detector = edge_detector
+
+        pos, neg = self._edge_detector.detect_edges(self._origin)
+        cov = np.square((pos - neg) / 2)
+
+        assert (is_positive_definite(cov))
+
+        # self._centered_origin=(np.mean(pos,axis=0)+np.mean(neg,axis=0))/2
+        # mean=self._centered_origin
+        mean = self._origin
+        self._normal_distribution = multivariate_normal(mean=mean, cov=cov)
+
+    def sample_at(self, points):
+        probs = self._normal_distribution.pdf(points)
+        return (points, probs, 1 / probs)
+
+    def sample(self, n):
+        """Return n samples of points around the origin along with
+        their probabilities of being sampled
+
+        Parameters
+        ----------
+        n : int
+
+        Returns
+        -------
+        (array,array,array), coordinates of the sampled points, probability density of choosing each point, inverse of PDF
+
+        """
+        points = self._normal_distribution.rvs(n)
+        return self.sample_at(points)
+
+
+class SpaceSampler(object):
+    """Sample random points from a space, subject to the provided constraints.
+
+    Sampling occurs by selecting a feasible point, and adding additional points to
+    the list of sampled points based on a normal distribution that originates at
+    the original feasible point. The process can be repeated as much as desired to
+    achieve more uniformity in the sampling."""
+
+    def _throw_dart(self, values):
+        """Given a list of values randomly select one and return its index,
+        using the values themselves as their weighted probabilities
+
+        Parameters
+        ----------
+        values : array
+
+        Returns
+        -------
+        int
+
+        """
+        assert (min(values) > 0)
+        dart = np.sum(values) * np.random.random()
+
+        running_total = 0
+        for ix in xrange(len(self._sampled_points)):
+            running_total = running_total + self._sampled_points[ix, -1]
+            if (dart < running_total):
+                break
+
+        assert (ix < len(self._sampled_points))
+        return ix
+
+    def _select_sampling_target(self):
+        """Pick a point using the inverse of the PDF as a weighting scheme
+        Returns
+        -------
+        int
+
+        """
+        #remember it's [point coordinates ..., PDF, inv PDF]
+        return self._throw_dart(self._sampled_points[:, -1])
+
+    def _select_deletion_target(self):
+        """Pick a point using the PDF as a weighting scheme
+        Returns
+        -------
+        int
+
+        """
+        #remember it's [point coordinates ..., PDF, inv PDF]
+        return self._throw_dart(self._sampled_points[:, -2])
+
+    def _find_next_entry(self):
+        """Select a point from the current list of points via inverse PDF weighting
+        and create a distribution around it. Then return a point with its corresponding
+        PDF and inverse PDF from that distribution
+
+        Returns
+        -------
+        array
+
+        """
+        sample_power = 10
+        while True:
+            assert (len(self._sampled_points) > 0)
+            ix = self._select_sampling_target()
+            next_distribution = SourceDistribution(
+                self._sampled_points[ix, :-2], self._edge_detector)
+            next_points, next_pdfs, next_invpdfs = next_distribution.sample(
+                sample_power)
+
+            hits = [self._constraint.apply(p) for p in next_points]
+            if not np.any(hits):
+                sample_power = 10 * sample_power
+                continue
+
+            positive_hits = np.where(hits)[0]
+
+            new_ix = positive_hits[0]
+            next_point = next_points[new_ix]
+            next_pdf = next_pdfs[new_ix]
+            next_invpdf = next_invpdfs[new_ix]
+            assert (self._constraint.apply(next_point))
+
+            next_entry = np.append(next_point, [next_pdf, next_invpdf])
+            return next_entry
+
+    def __init__(self, constraint, max_edge_search):
+        """Initialize with a constraint that defines the allowed space we want to
+        sample in.
+
+        Parameters
+        ----------
+        constraint : Constraint
+        max_edge_search : int
+
+
+        """
+        self._constraint = constraint
+        self._edge_detector = EdgeDetector(self._constraint, max_edge_search)
+        self._sampled_points = np.array([])
+        # self._fill_initial_samples()
+
+        #Fill the samples list with the one point we do know
+        initial_distribution = SourceDistribution(
+            self._constraint.get_example(), self._edge_detector)
+        initial_point, initial_pdf, initial_invpdf = initial_distribution.sample_at(
+            self._constraint.get_example())
+        #store coords alongside pdf and inverse pdf. pdf values are last two columns
+        self._sampled_points = np.array(
+            [initial_point + [initial_pdf] + [initial_invpdf]])
+
+    def num_samples(self, progress=False):
+        return len(self._sampled_points)
+
+    def sample(self, n, progress=False):
+        """The first batch of points are selected just like the diffusion step,
+        but because we are filling the array for the first time, no points are
+        deleted
+
+        Parameters
+        ----------
+        n : int, number of desired samples
+        progress : bool, whether a progress bar should be printed as samples are taken
+
+        Returns
+        -------
+        void
+
+        """
+        n = int(n)
+
+        if (n < 1):
+            raise ValueError("Must sample at least one point in the space!")
+
+        if progress:
+            bar = progress_bar(n)
+            bar.start()
+
+        if self.num_samples() > n:
+            self._sampled_points = self._sampled_points[:n]
+            if progress:
+                bar.update(len(self._sampled_points))
+
+        else:
+            while len(self._sampled_points) < n:
+                next_entry = self._find_next_entry()
+                self._sampled_points = np.vstack((self._sampled_points,
+                                                  [next_entry]))
+                if progress:
+                    bar.update(len(self._sampled_points))
+
+        if progress:
+            bar.finish()
+
+        return
+
+    def diffuse(self):
+        """Replace an old point with a new one, to make the samples a little more
+        uniform
+
+        Returns
+        -------
+        void
+
+        """
+        ix = self._select_deletion_target()
+        next_entry = self._find_next_entry()
+        self._sampled_points[ix, :] = next_entry[:]
+        return
+
+    def write_samples(self, path):
+        """Dump the sampled points into the provided filename
+
+        Parameters
+        ----------
+        path : name of file
+
+        Returns
+        -------
+        void
+
+        """
+        only_coords = self._sampled_points[:, 0:-2]
+        np.savetxt(path, only_coords, delimiter=' ')
+        return
+
+
+def main():
+    start_time = time.time()
+
+    #should be done within 5 minutes
+    time_limit = 300
+
+    try:
+        in_file, out_file, num_samples = _parsed_input(sys.argv)
+    except:
+        print(
+            "Expected arguments in the form `./sampler <input_file> <output_file> <n_results>`"
+        )
+        exit()
+
+    print("Reading constraints from {}...".format(in_file))
+    c = Constraint(in_file)
+
+    #50 determines the number of iterations performing a binary search from a particular point
+    #to the boundary of the allowed subspace. Make bigger if the subspace is really really small.
+    print("Generating initial samples...")
+    sampler = SpaceSampler(c, 50)
+    sampler.sample(num_samples, progress=True)
+
+    #This step might nor even make a difference for a lot of cases, but for weirdly shaped subspaces
+    #the sampling might end up not being as uniform as you want. This block will allow samples to
+    #diffuse within the allowed subspace so they become more uniformly distributed. Time cap at
+    #5 minutes, or just ctrl+c to skip this part.
+    if time.time() - start_time < time_limit:
+        print(
+            "Diffusing samples for good measure... Skip to file writing with ctrl+c"
+        )
+        try:
+            remaining_time = time_limit - (time.time() - start_time)
+            bar = progress_bar(remaining_time)
+            bar.start()
+            while time.time() < start_time + time_limit:
+                sampler.diffuse()
+                #Sometimes the max time is slightly exceeded and the bar freaks out, so use min
+                bar.update(min(remaining_time, time.time() - start_time))
+            bar.finish()
+        except KeyboardInterrupt:
+            print("\nReceived interrupt. Skipping diffusion step.")
+
+    print("Writing files to {}...".format(out_file))
+    sampler.write_samples(out_file)
+
+    print("All done!")
+
+
+if __name__ == "__main__":
+    main()
